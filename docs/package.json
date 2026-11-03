@@ -11,7 +11,7 @@
     "@astrojs/starlight": "catalog:",
     "@yielded/starlight-theme": "catalog:",
     "astro": "catalog:",
-    "satteri": "0.10.5",
+    "satteri": "0.11.6",
     "starlight-links-validator": "catalog:"
   }
 }
