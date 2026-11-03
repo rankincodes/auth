@@ -1,5 +1,12 @@
 # @yielded/auth-platform-workerd
 
+## 0.1.0-beta.48
+
+### Patch Changes
+
+- Updated dependencies [[`e2705d9`](https://github.com/yielded-dev/auth/commit/e2705d950d6213f8befc8e07ed59c400b3869393)]:
+  - @yielded/auth@0.1.0-beta.48
+
 ## 0.1.0-beta.47
 
 ### Minor Changes

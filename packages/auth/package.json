@@ -1,6 +1,6 @@
 {
   "name": "@yielded/auth",
-  "version": "0.1.0-beta.47",
+  "version": "0.1.0-beta.48",
   "description": "Composable authentication, sessions, and identity workflows for Effect.",
   "keywords": [
     "authentication",

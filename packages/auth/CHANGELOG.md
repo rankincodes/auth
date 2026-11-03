@@ -1,5 +1,13 @@
 # @yielded/auth
 
+## 0.1.0-beta.48
+
+### Patch Changes
+
+- [#300](https://github.com/yielded-dev/auth/pull/300) [`e2705d9`](https://github.com/yielded-dev/auth/commit/e2705d950d6213f8befc8e07ed59c400b3869393) Thanks [@danieljvdm](https://github.com/danieljvdm)! - Use Effect's bundled JOSE implementation and require Effect 4.1.2 across the package family. Replace `@yielded/jose` imports with `effect/jose`; use Effect durations for JWT age and remote JWKS settings, and match JOSE errors through their typed `reason`.
+- Updated dependencies [[`e2705d9`](https://github.com/yielded-dev/auth/commit/e2705d950d6213f8befc8e07ed59c400b3869393)]:
+  - @yielded/oauth@0.1.0-beta.48
+
 ## 0.1.0-beta.47
 
 ### Minor Changes

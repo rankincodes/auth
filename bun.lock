@@ -216,7 +216,7 @@
     },
     "packages/auth": {
       "name": "@yielded/auth",
-      "version": "0.1.0-beta.47",
+      "version": "0.1.0-beta.48",
       "dependencies": {
         "@yielded/oauth": "workspace:*",
       },
@@ -236,7 +236,7 @@
     },
     "packages/auth-electron": {
       "name": "@yielded/auth-electron",
-      "version": "0.1.0-beta.47",
+      "version": "0.1.0-beta.48",
       "dependencies": {
         "@yielded/auth": "workspace:*",
       },
@@ -255,7 +255,7 @@
     },
     "packages/auth-persistence": {
       "name": "@yielded/auth-persistence",
-      "version": "0.1.0-beta.47",
+      "version": "0.1.0-beta.48",
       "dependencies": {
         "@yielded/auth": "workspace:*",
       },
@@ -276,7 +276,7 @@
     },
     "packages/auth-persistence-drizzle": {
       "name": "@yielded/auth-persistence-drizzle",
-      "version": "0.1.0-beta.47",
+      "version": "0.1.0-beta.48",
       "dependencies": {
         "@yielded/auth": "workspace:*",
         "@yielded/auth-persistence": "workspace:*",
@@ -328,7 +328,7 @@
     },
     "packages/auth-platform-workerd": {
       "name": "@yielded/auth-platform-workerd",
-      "version": "0.1.0-beta.47",
+      "version": "0.1.0-beta.48",
       "dependencies": {
         "@yielded/auth": "workspace:*",
       },
@@ -347,7 +347,7 @@
     },
     "packages/auth-react-native": {
       "name": "@yielded/auth-react-native",
-      "version": "0.1.0-beta.47",
+      "version": "0.1.0-beta.48",
       "dependencies": {
         "@yielded/auth": "workspace:*",
       },
@@ -379,7 +379,7 @@
     },
     "packages/auth-simplewebauthn": {
       "name": "@yielded/auth-simplewebauthn",
-      "version": "0.1.0-beta.47",
+      "version": "0.1.0-beta.48",
       "dependencies": {
         "@yielded/auth": "workspace:*",
         "tldts": "catalog:",
@@ -404,7 +404,7 @@
     },
     "packages/oauth": {
       "name": "@yielded/oauth",
-      "version": "0.1.0-beta.47",
+      "version": "0.1.0-beta.48",
       "devDependencies": {
         "@effect/platform-node": "catalog:",
         "@effect/vitest": "catalog:",
