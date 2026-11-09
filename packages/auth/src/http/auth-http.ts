@@ -100,6 +100,12 @@ export interface AuthHttpOptions<E = never, R = never, ResponseR = never> {
   };
   readonly csrf?: { readonly header: string; readonly value: string };
   readonly oauth?: OAuthOptions<E, R, ResponseR>;
+  /** Native clients that hold private credentials themselves, such as an iOS app
+   * completing `oauthCompleteNativeSignIn`. A request selects native mode with
+   * `modeHeader: native`, carries credentials only in `requestHeaders`, and receives
+   * issued credentials in `responseHeaders`; it must send no Origin or cookies and
+   * pass `authorize`. Browser requests and OAuth callbacks are unchanged. */
+  readonly native?: OperationHttpConfiguration["native"];
 }
 
 type OAuthConfiguration<O> = O extends { readonly oauth?: infer C } ? Exclude<C, undefined> : never;
@@ -280,6 +286,7 @@ export const make = <
         csrfValue: options.csrf?.value ?? "1",
         maximumBodyBytes: options.maximumBodyBytes ?? 65536,
         maximumUrlBytes: options.maximumUrlBytes ?? 8192,
+        ...(options.native === undefined ? {} : { native: options.native }),
       });
     }),
   );
