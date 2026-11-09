@@ -217,6 +217,14 @@ recent authentication.
 The default consent policy requires interaction. Supply `OAuthServer.OpenIdConsent`
 to recognize application-approved clients, callbacks, and claims.
 
+A first-party app that authenticated without a browser can get a code from
+`service.issueAuthorizationCode({ clientId, redirectUri, scopes, state, codeChallenge,
+codeChallengeMethod: "S256", nonce, authentication })` and redeem it at the token
+endpoint. Pass the application's verified `Authentication`. The same client,
+redirect, PKCE, scope, and `Identity.active` checks apply. It never prompts:
+unless `OpenIdConsent` approves the exact client, callback, and scopes, it fails
+with `consent_required`.
+
 ID tokens last at most five minutes and access tokens at most ten, bounded by the
 originating session. An enabled refresh grant lasts at most thirty days, bounded
 by the original session expiry. Refresh checks `Identity.active` and application

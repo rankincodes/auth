@@ -4,6 +4,8 @@ export {
   type Options,
   type OpenIdOptions,
   type OpenIdIdentity,
+  type AuthorizationCodeRequest,
+  type AuthorizationCodeResponse,
 } from "./oauth/server/server";
 
 export type { IdentitySigningKeys } from "./oauth/server/openid";
@@ -29,5 +31,6 @@ export {
   InvalidToken,
   Persistence,
   Record,
+  Rejected,
   Unavailable,
 } from "./oauth/server/models";

@@ -28,7 +28,7 @@ import type * as Types from "effect/Types";
 
 import { reportAuthFailure, ReportedOperationDefect } from "../../internal/diagnostics";
 import { origin as Origin } from "../../internal/origin";
-import { timeoutWithCause } from "../../internal/timeout";
+import { timeoutOrElseWithCause, timeoutWithCause } from "../../internal/timeout";
 import * as OAuthScope from "../../OAuthScope";
 import { SubjectId } from "../../Schema";
 import { makeSessionSigningCodec, type SessionSigningKeyring } from "../../sessions/crypto";
@@ -67,6 +67,8 @@ import {
   makeAccessSchema,
   makeScopesSchema,
   maximumClientAssertionLength,
+  RedirectUri,
+  type Rejected,
   Unavailable,
   type Record,
 } from "./models";
@@ -168,6 +170,41 @@ const TokenRequest = Schema.Union([
 ]);
 
 const Decision = Schema.Struct({ csrf: Random, decision: Schema.Literals(["approve", "deny"]) });
+
+const CodeRequest = Schema.Struct({
+  clientId: Text,
+  redirectUri: RedirectUri,
+  state: Schema.optionalKey(Schema.String.check(Schema.isMaxLength(2048))),
+  codeChallenge: Random,
+  codeChallengeMethod: Schema.Literal("S256"),
+  nonce: Schema.optionalKey(Text),
+  authentication: Authentication,
+});
+
+/** Programmatic issuance of an authorization code, as the authorization endpoint
+ * would return after approval. `authentication` is the application's own verified
+ * session, never values supplied by the OAuth client. */
+export interface AuthorizationCodeRequest<
+  Scope extends OAuthScope.OAuthScope = OAuthScope.OAuthScope,
+> {
+  readonly clientId: string;
+  /** Exactly one of the client's registered redirect URIs. */
+  readonly redirectUri: string;
+  /** Must include openid. */
+  readonly scopes: ReadonlyArray<Scope>;
+  readonly state?: string;
+  readonly codeChallenge: string;
+  readonly codeChallengeMethod: "S256";
+  readonly nonce?: string;
+  readonly authentication: Authentication;
+}
+
+/** Return these to the client exactly as an authorization response would. */
+export interface AuthorizationCodeResponse {
+  readonly code: Redacted.Redacted<string>;
+  readonly state?: string;
+  readonly iss: string;
+}
 
 const Revocation = Schema.Struct({
   client_id: Text,
@@ -355,6 +392,16 @@ const makeServer = <
       ) => Effect.Effect<Access<Scope>, InvalidToken | Unavailable>;
       /** Trusted application operation, e.g. disabling an account or connection. */
       readonly revoke: (grantId: string) => Effect.Effect<void, Unavailable>;
+      /** Issue an authorization code without the browser authorization endpoint, for an
+       * application that already authenticated the user, such as a first-party native
+       * app. Applies the endpoint's client, exact redirect, S256, scope and session
+       * rules. Never prompts: unless OpenIdConsent already approves this exact client,
+       * redirect and scopes, it fails with consent_required. Redeem the code at the
+       * unchanged token endpoint. OpenID servers only; plain OAuth servers always require
+       * interactive consent. */
+      readonly issueAuthorizationCode: (
+        input: AuthorizationCodeRequest<Scope>,
+      ) => Effect.Effect<AuthorizationCodeResponse, Rejected | Unavailable>;
       readonly resource: string;
       readonly resourceMetadata: string;
       /** Exact name for this configured origin, including the HTTPS host prefix. */
@@ -682,6 +729,88 @@ const makeServer = <
             ...(record.claims === undefined ? {} : { claims: record.claims }),
           }).pipe(Effect.mapError(() => InvalidToken.make({})));
         });
+
+        const issueAuthorizationCode = Effect.fn("OAuthServer.issueAuthorizationCode")(
+          function* (input: AuthorizationCodeRequest<Scope>) {
+            const request = yield* Schema.decodeUnknownEffect(CodeRequest)(input).pipe(
+              Effect.mapError(() => reject()),
+            );
+
+            const client = yield* clientFor(request.clientId);
+
+            if (!matchesRedirect(client, request.redirectUri)) return yield* reject();
+            if (
+              client.grantTypes !== undefined &&
+              !client.grantTypes.includes("authorization_code")
+            )
+              return yield* reject("unauthorized_client");
+
+            const scopes = yield* Schema.decodeUnknownEffect(ScopesSchema)([
+              ...new Set(input.scopes),
+            ]).pipe(Effect.mapError(() => reject("invalid_scope")));
+
+            if (openId === undefined || identity.openId === undefined)
+              return yield* reject("consent_required");
+            if (!scopes.some((scope) => scope === "openid")) return yield* reject("invalid_scope");
+            const authentication = request.authentication;
+            const time = yield* now;
+
+            if (
+              authentication.authenticatedAtMillis > time ||
+              authentication.expiresAtMillis <= time ||
+              !(yield* identity.openId.active(authentication))
+            )
+              return yield* reject("login_required");
+            if (
+              !(yield* openIdConsent.approved({
+                clientId: client.clientId,
+                redirectUri: request.redirectUri,
+                scopes,
+                authentication,
+              }))
+            )
+              return yield* reject("consent_required");
+
+            const grantId = yield* random;
+            const version = yield* random;
+            const expiresAtMillis = (yield* now) + 60_000;
+
+            const authorization = Authorization.make({
+              clientId: client.clientId,
+              redirectUri: request.redirectUri,
+              scopes,
+              challenge: request.codeChallenge,
+              ...(request.nonce === undefined ? {} : { nonce: request.nonce }),
+              requestedAtMillis: time,
+              ...(request.state === undefined ? {} : { state: request.state }),
+            });
+
+            // Sign before the only commit; release the code only after it is stored.
+            const code = yield* encode("code", grantId, version, expiresAtMillis);
+
+            if (
+              !(yield* store.insert(namespace, grantId, {
+                status: "Code",
+                version,
+                authorization,
+                subjectId: authentication.subjectId,
+                authentication,
+                expiresAtMillis,
+              }))
+            )
+              return yield* Unavailable.make({});
+
+            return {
+              code,
+              ...(request.state === undefined ? {} : { state: request.state }),
+              iss: config.origin,
+            };
+          },
+          timeoutOrElseWithCause({
+            duration: "30 seconds",
+            orElse: () => Effect.fail(Unavailable.make({})),
+          }),
+        );
 
         const handle = Effect.fn("OAuthServer.handle")(
           function* (web: Request) {
@@ -1488,6 +1617,7 @@ const makeServer = <
           handle,
           verify,
           revoke: (grantId) => store.revoke(namespace, grantId),
+          issueAuthorizationCode,
           resource: config.resource,
           resourceMetadata,
           cookieName,
