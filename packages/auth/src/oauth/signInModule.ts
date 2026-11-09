@@ -44,6 +44,7 @@ import {
 import { OAuthReturnTargets } from "./OAuthReturnTargets";
 import { OAuthSignInPersistence } from "./OAuthSignInPersistence";
 import { OAuthTransactionProtector } from "./OAuthTransactionProtector";
+import type { OAuthGrantId, OAuthPermissionProfileKey } from "./permissionProfile";
 import {
   claimsIdentitySchema,
   type OAuthClaimsIdentity,
@@ -61,12 +62,20 @@ import { signInAccess } from "./signInAccess";
 import {
   OAuthConfigurationError,
   OAuthMethodUnsupported,
+  type OAuthProtocolRejected,
   OAuthRejected,
   OAuthUnavailable,
 } from "./signInErrors";
 import {
   OAuthCallbackResponse,
   OAuthConsumeDecision,
+  OAuthNativeCallbackId,
+  OAuthNativeProtocolConfiguration,
+  OAuthNativeProtocolPreparation,
+  OAuthNativeSignInAuthorization,
+  OAuthNativeSignInBegin,
+  OAuthNativeSignInComplete,
+  OAuthNativeSignInInput,
   OAuthCredentialSnapshot,
   OAuthIssueDecision,
   OAuthModuleId,
@@ -123,6 +132,61 @@ const stateMessage = Schema.fromJsonString(
     Schema.String.check(Schema.isPattern(/^[A-Za-z0-9_-]{43}$/)),
   ]),
 );
+
+// Native flows have no provider state. Their consume key binds the flow to the
+// verified request binding instead, under a namespace no callback state can produce.
+const nativeStateMessage = Schema.fromJsonString(
+  Schema.Tuple([
+    Schema.Literal("effect-auth/oauth-native-state/v1"),
+    OAuthModuleId,
+    OAuthSignInPolicy.fields.generation,
+    OAuthSignInBegin.fields.provider,
+    OAuthSignInBegin.fields.flowId,
+    TokenDigest.check(Schema.isPattern(/^[A-Za-z0-9_-]{43}$/)),
+  ]),
+);
+
+type Connection = {
+  readonly grantId: typeof OAuthGrantId.Type;
+  readonly profileKey: typeof OAuthPermissionProfileKey.Type;
+};
+
+/** One provider exchange within the flow's captured deadline; protocol rejections
+ * become OAuthRejected and a timeout becomes OAuthUnavailable. */
+const exchangeWithin = <R>(
+  effect: Effect.Effect<
+    OAuthVerifiedExternalIdentity,
+    OAuthProtocolRejected | OAuthRejected | OAuthUnavailable,
+    R
+  >,
+  millis: number,
+) =>
+  bounded(effect, millis).pipe(
+    Effect.tapError((error) =>
+      reportAuthDiagnostic(
+        "oauth-exchange",
+        error._tag === "TimeoutError"
+          ? "timeout"
+          : error._tag === "OAuthProtocolRejected" || error._tag === "OAuthRejected"
+            ? "rejected"
+            : "unavailable",
+      ),
+    ),
+    Effect.catchCause((cause) =>
+      Effect.failCause(
+        Cause.map(cause, (error) =>
+          error._tag === "TimeoutError" ? OAuthUnavailable.make({}) : error,
+        ),
+      ),
+    ),
+    Effect.catchCause((cause) =>
+      Effect.failCause(
+        Cause.map(cause, (error) =>
+          error._tag === "OAuthProtocolRejected" ? OAuthRejected.make({}) : error,
+        ),
+      ),
+    ),
+  );
 
 export interface OAuthModule<Id extends string, Kind extends string, Claims> {
   readonly moduleId: Id;
@@ -354,6 +418,16 @@ export const makeOAuthMethod = <
       readonly complete: (
         input: typeof OAuthSignInComplete.Type,
       ) => Effect.Effect<AuthOperationResult<CompletionResult>, Failure>;
+      /** Begin native sign-in for a platform sheet. The result's nonce goes to the
+       * platform request; the request binding is delivered privately as for `begin`. */
+      readonly beginNative: (
+        input: typeof OAuthNativeSignInBegin.Type,
+      ) => Effect.Effect<AuthOperationResult<typeof OAuthNativeSignInAuthorization.Type>, Failure>;
+      /** Complete native sign-in with the platform's code. Same consumption, provider
+       * exchange, registration and session issuance as `complete`. */
+      readonly completeNative: (
+        input: typeof OAuthNativeSignInComplete.Type,
+      ) => Effect.Effect<AuthOperationResult<CompletionResult>, Failure>;
     }
   >(`effect-auth/oauth/${moduleId.length}:${moduleId}/SignIn`);
 
@@ -384,7 +458,14 @@ export const makeOAuthMethod = <
         const registration = yield* registrationSource;
         const access = yield* signInAccess(moduleId, policy, options.access);
         const { issue: issueBinding, verify: verifyBinding } = yield* binding.RequestBinding;
-        const { prepareAuthorization, exchangeVerifiedIdentity } = yield* OAuthProtocol;
+
+        const {
+          prepareAuthorization,
+          exchangeVerifiedIdentity,
+          prepareNative,
+          exchangeNativeIdentity,
+        } = yield* OAuthProtocol;
+
         const { resolve: returnTarget } = yield* OAuthReturnTargets;
         const { seal, open } = yield* OAuthTransactionProtector;
         const { issue, consume, resolve } = yield* OAuthSignInPersistence;
@@ -438,20 +519,38 @@ export const makeOAuthMethod = <
             ? OAuthRejected.make({})
             : OAuthUnavailable.make({});
 
-        const begin = Effect.fn("OAuth.SignIn.begin")(function* (
-          raw: typeof OAuthSignInBegin.Type,
+        const nativeStateDigest = Effect.fn("OAuth.nativeStateDigest")(function* (
+          flowId: typeof OAuthNativeSignInBegin.Type.flowId,
+          provider: typeof OAuthNativeSignInBegin.Type.provider,
+          verifier: TokenDigest,
         ) {
-          yield* noAmbient();
-          const request = yield* snapshotOAuthSignInBegin.effect(raw);
-          const target = yield* returnTarget(request.returnTarget);
+          const message = yield* Schema.encodeEffect(nativeStateMessage)([
+            "effect-auth/oauth-native-state/v1",
+            id,
+            policy.generation,
+            provider,
+            flowId,
+            verifier,
+          ]).pipe(Effect.mapError(() => OAuthUnavailable.make({})));
 
-          const canonicalTarget = yield* Schema.decodeEffect(OAuthReturnTarget)(target).pipe(
+          return yield* hash(message);
+        });
+
+        const resolveTarget = Effect.fn("OAuth.returnTarget")(function* (input: string) {
+          const target = yield* returnTarget(input);
+
+          return yield* Schema.decodeEffect(OAuthReturnTarget)(target).pipe(
             Effect.catchCause((cause) =>
               Effect.failCause(Cause.map(cause, () => OAuthUnavailable.make({}))),
             ),
           );
+        });
 
-          const issuedBinding = yield* issueBinding(request.flowId).pipe(
+        /** Issue and immediately verify the private binding a completion must present. */
+        const entryBinding = Effect.fn("OAuth.entryBinding")(function* (
+          flowId: typeof OAuthSignInBegin.Type.flowId,
+        ) {
+          const issuedBinding = yield* issueBinding(flowId).pipe(
             Effect.catchCause((cause) => Effect.failCause(Cause.map(cause, binderError))),
           );
 
@@ -461,7 +560,7 @@ export const makeOAuthMethod = <
             issuedBinding.credentialCommands.length !== 1 ||
             original?._tag !== "Issue" ||
             original.slot !== "request-binding" ||
-            issuedBinding.value.flowId !== request.flowId ||
+            issuedBinding.value.flowId !== flowId ||
             original.expiresAtMillis !== issuedBinding.value.expiresAtMillis
           )
             return yield* OAuthUnavailable.make({});
@@ -475,13 +574,70 @@ export const makeOAuthMethod = <
 
           const binder = Object.freeze({
             ...(yield* verifyBinding(
-              request.flowId,
+              flowId,
               Redacted.make(Redacted.value(command.credential)),
             ).pipe(Effect.catchCause((cause) => Effect.failCause(Cause.map(cause, binderError))))),
           });
 
           if (binder.expiresAtMillis !== command.expiresAtMillis)
             return yield* OAuthUnavailable.make({});
+
+          return { command, binder };
+        });
+
+        /** Seal and durably issue one flow; release its result only after the commit. */
+        const issueFlow = Effect.fn("OAuth.issueFlow")(function* <A>(
+          context: OAuthSignInTransactionContext,
+          secrets: OAuthTransactionSecrets,
+          result: AuthOperationResult<A>,
+        ) {
+          const sealed = yield* seal({
+            context: yield* snapshotOAuthSignInTransactionContext.effect(context),
+            secrets: yield* snapshotOAuthTransactionSecrets.effect(secrets),
+          }).pipe(Effect.flatMap((value) => snapshotOAuthSealedTransaction.effect(value)));
+
+          const flow = yield* snapshotOAuthSignInFlow.effect({ context, sealed });
+
+          const expected = yield* Schema.encodeEffect(flowJson)(flow).pipe(Effect.orDie);
+
+          type Issuance =
+            | { readonly _tag: "Rejected" }
+            | { readonly _tag: "Issued"; readonly result: AuthOperationResult<A> };
+
+          const receipt = yield* issue<Issuance>(
+            yield* snapshotOAuthSignInFlow.effect(flow),
+            prepareCommit<OAuthIssueDecision, Issuance, OAuthUnavailable>((decision, journal) =>
+              Result.gen(function* () {
+                const checked = snapshotOAuthIssueDecision.sync(decision);
+
+                if (checked._tag === "Rejected")
+                  return journal.prepare({ _tag: "Rejected" as const });
+                if (
+                  (yield* Schema.encodeResult(flowJson)(checked.flow).pipe(
+                    Result.mapError(() => OAuthUnavailable.make({})),
+                  )) !== expected
+                )
+                  return yield* Result.fail(OAuthUnavailable.make({}));
+
+                return journal.prepare({ _tag: "Issued" as const, result });
+              }),
+            ),
+          );
+
+          const committed = yield* read(receipt);
+
+          if (committed._tag === "Rejected") return yield* OAuthRejected.make({});
+
+          return committed.result;
+        });
+
+        const begin = Effect.fn("OAuth.SignIn.begin")(function* (
+          raw: typeof OAuthSignInBegin.Type,
+        ) {
+          yield* noAmbient();
+          const request = yield* snapshotOAuthSignInBegin.effect(raw);
+          const canonicalTarget = yield* resolveTarget(request.returnTarget);
+          const { command, binder } = yield* entryBinding(request.flowId);
 
           const prepared = yield* (access?.prepare ?? prepareAuthorization)(
             Object.freeze({
@@ -530,62 +686,175 @@ export const makeOAuthMethod = <
             exchangeTimeoutMillis: policy.exchangeTimeoutMillis,
           });
 
-          const sealed = yield* seal({
-            context: yield* snapshotOAuthSignInTransactionContext.effect(context),
-            secrets: yield* snapshotOAuthTransactionSecrets.effect(prepared.secrets),
-          }).pipe(Effect.flatMap((value) => snapshotOAuthSealedTransaction.effect(value)));
-
-          const flow = yield* snapshotOAuthSignInFlow.effect({
+          return yield* issueFlow(
             context,
-            sealed,
+            prepared.secrets,
+            Object.freeze({
+              value: Object.freeze({
+                flowId: request.flowId,
+                authorizationUrl: prepared.authorizationUrl,
+                expiresAtMillis,
+              }),
+              credentialCommands: Object.freeze([formPostBinding(command, prepared.responseMode)]),
+            }),
+          );
+        });
+
+        const beginNative = Effect.fn("OAuth.SignIn.beginNative")(function* (
+          raw: typeof OAuthNativeSignInBegin.Type,
+        ) {
+          yield* noAmbient();
+          // Retained provider access needs the connected grant exchange; native completion has none.
+          if (prepareNative === undefined || access !== undefined)
+            return yield* OAuthMethodUnsupported.make({});
+          const request = yield* snapshotOAuthNativeSignInBegin.effect(raw);
+          const canonicalTarget = yield* resolveTarget(request.returnTarget);
+          const { command, binder } = yield* entryBinding(request.flowId);
+
+          const prepared = yield* prepareNative(
+            Object.freeze({ provider: request.provider, flowId: request.flowId }),
+          ).pipe(Effect.flatMap((value) => snapshotOAuthNativeProtocolPreparation.effect(value)));
+
+          const nonce = prepared.secrets.oidcNonce;
+
+          if (
+            prepared.configuration.provider !== request.provider ||
+            prepared.configuration.callbackId !== OAuthNativeCallbackId ||
+            nonce === undefined ||
+            prepared.secrets.pkceVerifier !== undefined
+          )
+            return yield* OAuthUnavailable.make({});
+          const now = DateTime.toEpochMillis(yield* DateTime.now);
+          const expiresAtMillis = Math.min(now + policy.lifetimeMillis, binder.expiresAtMillis);
+
+          if (expiresAtMillis <= now) return yield* OAuthRejected.make({});
+
+          const context = yield* snapshotOAuthSignInTransactionContext.effect({
+            namespace: "effect-auth/oauth-sign-in-context/v1",
+            moduleId: id,
+            generation: policy.generation,
+            flowId: request.flowId,
+            ...prepared.configuration,
+            returnTarget: canonicalTarget,
+            stateDigest: yield* nativeStateDigest(
+              request.flowId,
+              request.provider,
+              binder.verifier,
+            ),
+            requestBindingVerifier: binder.verifier,
+            requestBindingExpiresAtMillis: binder.expiresAtMillis,
+            issuedAtMillis: now,
+            expiresAtMillis,
+            exchangeTimeoutMillis: policy.exchangeTimeoutMillis,
           });
 
-          const expected = yield* Schema.encodeEffect(flowJson)(flow).pipe(Effect.orDie);
-
-          type Issuance =
-            | { readonly _tag: "Rejected" }
-            | {
-                readonly _tag: "Issued";
-                readonly result: AuthOperationResult<typeof OAuthSignInAuthorization.Type>;
-              };
-
-          const receipt = yield* issue<Issuance>(
-            yield* snapshotOAuthSignInFlow.effect(flow),
-            prepareCommit<OAuthIssueDecision, Issuance, OAuthUnavailable>((decision, journal) =>
-              Result.gen(function* () {
-                const checked = snapshotOAuthIssueDecision.sync(decision);
-
-                if (checked._tag === "Rejected")
-                  return journal.prepare({ _tag: "Rejected" as const });
-                if (
-                  (yield* Schema.encodeResult(flowJson)(checked.flow).pipe(
-                    Result.mapError(() => OAuthUnavailable.make({})),
-                  )) !== expected
-                )
-                  return yield* Result.fail(OAuthUnavailable.make({}));
-
-                return journal.prepare({
-                  _tag: "Issued" as const,
-                  result: Object.freeze({
-                    value: Object.freeze({
-                      flowId: request.flowId,
-                      authorizationUrl: prepared.authorizationUrl,
-                      expiresAtMillis,
-                    }),
-                    credentialCommands: Object.freeze([
-                      formPostBinding(command, prepared.responseMode),
-                    ]),
-                  }),
-                });
-              }),
-            ),
+          return yield* issueFlow(
+            context,
+            prepared.secrets,
+            Object.freeze({
+              value: Object.freeze({ flowId: request.flowId, nonce, expiresAtMillis }),
+              credentialCommands: Object.freeze([command]),
+            }),
           );
+        });
 
-          const committed = yield* read(receipt);
+        /** Shared tail after one verified exchange: match the account, then either
+         * issue a registration intent or authenticate. */
+        const settle = Effect.fn("OAuth.SignIn.settle")(function* <E, R>(
+          flow: OAuthSignInFlow,
+          identity: OAuthVerifiedExternalIdentity,
+          startedAtMillis: number,
+          retain: (
+            credential: OAuthCredentialSnapshot,
+          ) => Effect.Effect<Connection | undefined, E, R>,
+        ) {
+          const context = flow.context;
+          let verifiedAt = startedAtMillis;
 
-          if (committed._tag === "Rejected") return yield* OAuthRejected.make({});
+          if (
+            identity.identity.provider !== context.provider ||
+            identity.identity.issuer !== context.issuer
+          )
+            return yield* OAuthRejected.make({});
+          if (identity.upstreamAuthenticatedAt !== undefined)
+            verifiedAt = Math.min(
+              verifiedAt,
+              DateTime.toEpochMillis(identity.upstreamAuthenticatedAt),
+            );
 
-          return committed.result;
+          const resolved = yield* resolve({ moduleId: id, identity: identity.identity });
+
+          if (resolved === undefined) {
+            if (registration === undefined) return yield* OAuthRejected.make({});
+
+            const prepared = yield* registrationSecrets.prepare(
+              flow,
+              identity,
+              verifiedAt,
+              registration.policy,
+            );
+
+            if (prepared === undefined) return yield* OAuthRejected.make({});
+            const intentCodec = Schema.fromJsonString(OAuthRegistrationIntent);
+
+            const expected = yield* Schema.encodeEffect(intentCodec)(prepared.intent).pipe(
+              Effect.orDie,
+            );
+
+            const issued = yield* registration
+              .issue(
+                { intent: prepared.intent },
+                prepareCommit((value, journal) =>
+                  Result.gen(function* () {
+                    const checked = snapshotOAuthRegistrationIssueDecision.sync(value);
+
+                    if (
+                      checked._tag === "RegistrationIssued" &&
+                      (yield* Schema.encodeResult(intentCodec)(checked.intent).pipe(
+                        Result.mapError(() => OAuthUnavailable.make({})),
+                      )) !== expected
+                    )
+                      return yield* Result.fail(OAuthUnavailable.make({}));
+
+                    return journal.prepare(checked);
+                  }),
+                ),
+              )
+              .pipe(Effect.flatMap(read));
+
+            if (issued._tag !== "RegistrationIssued") return yield* OAuthRejected.make({});
+
+            return {
+              value: {
+                _tag: "RegistrationRequired" as const,
+                reference: issued.intent.reference,
+                expiresAtMillis: issued.intent.expiresAtMillis,
+                returnTarget: context.returnTarget,
+              },
+              credentialCommands: [prepared.command],
+            };
+          }
+          const credential = yield* checkCredential(resolved, identity);
+          const connection = yield* retain(credential);
+
+          const established = yield* authenticate({
+            context,
+            identity,
+            credential,
+            verifiedAtMillis: verifiedAt,
+          });
+
+          return {
+            value: {
+              completion: established.value,
+              returnTarget: context.returnTarget,
+              ...(connection === undefined ? {} : { connection }),
+            },
+            credentialCommands: [
+              ...established.credentialCommands,
+              { _tag: "Clear" as const, slot: "request-binding" as const },
+            ],
+          };
         });
 
         const complete = Effect.fn("OAuth.SignIn.complete")(
@@ -651,6 +920,11 @@ export const makeOAuthMethod = <
             )
               return yield* OAuthUnavailable.make({});
 
+            // Native flows have no redirect and are completed only by completeNative.
+            const redirectUri = context.redirectUri;
+
+            if (redirectUri === undefined) return yield* OAuthUnavailable.make({});
+
             if (response._tag === "Error")
               return {
                 value: { _tag: "Cancelled" as const, returnTarget: context.returnTarget },
@@ -658,9 +932,8 @@ export const makeOAuthMethod = <
               };
 
             const start = yield* DateTime.now;
-            let verifiedAt = DateTime.toEpochMillis(start);
 
-            const identity = yield* bounded(
+            const identity = yield* exchangeWithin(
               Effect.gen(function* () {
                 const secrets = yield* open({ context, sealed: flow.sealed }).pipe(
                   Effect.flatMap((value) => snapshotOAuthTransactionSecrets.effect(value)),
@@ -675,7 +948,10 @@ export const makeOAuthMethod = <
                   return yield* OAuthUnavailable.make({});
 
                 const exchangeInput = {
-                  configuration: yield* snapshotOAuthProtocolConfiguration.effect(context),
+                  configuration: yield* snapshotOAuthProtocolConfiguration.effect({
+                    ...context,
+                    redirectUri,
+                  }),
                   response,
                   secrets,
                   verificationStartedAt: start,
@@ -696,126 +972,15 @@ export const makeOAuthMethod = <
                 return exchanged.identity;
               }),
               context.exchangeTimeoutMillis,
-            ).pipe(
-              Effect.tapError((error) =>
-                reportAuthDiagnostic(
-                  "oauth-exchange",
-                  error._tag === "TimeoutError"
-                    ? "timeout"
-                    : error._tag === "OAuthProtocolRejected" || error._tag === "OAuthRejected"
-                      ? "rejected"
-                      : "unavailable",
-                ),
-              ),
-              Effect.catchCause((cause) =>
-                Effect.failCause(
-                  Cause.map(cause, (error) =>
-                    error._tag === "TimeoutError" ? OAuthUnavailable.make({}) : error,
-                  ),
-                ),
-              ),
-              Effect.catchCause((cause) =>
-                Effect.failCause(
-                  Cause.map(cause, (error) =>
-                    error._tag === "OAuthProtocolRejected" ? OAuthRejected.make({}) : error,
-                  ),
-                ),
-              ),
             );
 
-            if (
-              identity.identity.provider !== context.provider ||
-              identity.identity.issuer !== context.issuer
-            )
-              return yield* OAuthRejected.make({});
-            if (identity.upstreamAuthenticatedAt !== undefined)
-              verifiedAt = Math.min(
-                verifiedAt,
-                DateTime.toEpochMillis(identity.upstreamAuthenticatedAt),
-              );
-
-            const resolved = yield* resolve({ moduleId: id, identity: identity.identity });
-
-            if (resolved === undefined) {
-              if (registration === undefined) return yield* OAuthRejected.make({});
-
-              const prepared = yield* registrationSecrets.prepare(
-                flow,
-                identity,
-                verifiedAt,
-                registration.policy,
-              );
-
-              if (prepared === undefined) return yield* OAuthRejected.make({});
-              const intentCodec = Schema.fromJsonString(OAuthRegistrationIntent);
-
-              const expected = yield* Schema.encodeEffect(intentCodec)(prepared.intent).pipe(
-                Effect.orDie,
-              );
-
-              const issued = yield* registration
-                .issue(
-                  { intent: prepared.intent },
-                  prepareCommit((value, journal) =>
-                    Result.gen(function* () {
-                      const checked = snapshotOAuthRegistrationIssueDecision.sync(value);
-
-                      if (
-                        checked._tag === "RegistrationIssued" &&
-                        (yield* Schema.encodeResult(intentCodec)(checked.intent).pipe(
-                          Result.mapError(() => OAuthUnavailable.make({})),
-                        )) !== expected
-                      )
-                        return yield* Result.fail(OAuthUnavailable.make({}));
-
-                      return journal.prepare(checked);
-                    }),
-                  ),
-                )
-                .pipe(Effect.flatMap(read));
-
-              if (issued._tag !== "RegistrationIssued") return yield* OAuthRejected.make({});
-
-              return {
-                value: {
-                  _tag: "RegistrationRequired" as const,
-                  reference: issued.intent.reference,
-                  expiresAtMillis: issued.intent.expiresAtMillis,
-                  returnTarget: context.returnTarget,
-                },
-                credentialCommands: [prepared.command],
-              };
-            }
-            const credential = yield* checkCredential(resolved, identity);
-
-            const connection =
+            return yield* settle(flow, identity, DateTime.toEpochMillis(start), (credential) =>
               access === undefined
-                ? undefined
-                : yield* (function* () {
-                    if (privateGrant === undefined || grantStartedAt === undefined)
-                      return yield* OAuthUnavailable.make({});
-
-                    return yield* access.retain(flow, credential, privateGrant, grantStartedAt);
-                  })();
-
-            const established = yield* authenticate({
-              context,
-              identity,
-              credential,
-              verifiedAtMillis: verifiedAt,
-            });
-
-            return {
-              value: {
-                completion: established.value,
-                returnTarget: context.returnTarget,
-                ...(connection === undefined ? {} : { connection }),
-              },
-              credentialCommands: [
-                ...established.credentialCommands,
-                { _tag: "Clear" as const, slot: "request-binding" as const },
-              ],
-            };
+                ? Effect.as(Effect.void, undefined)
+                : privateGrant === undefined || grantStartedAt === undefined
+                  ? Effect.fail(OAuthUnavailable.make({}))
+                  : access.retain(flow, credential, privateGrant, grantStartedAt),
+            );
           },
           Effect.scoped,
           Effect.provideService(SecureRandom.SecureRandom, crypto),
@@ -828,7 +993,110 @@ export const makeOAuthMethod = <
           ),
         );
 
-        return SignIn.of({ begin, complete });
+        const completeNative = Effect.fn("OAuth.SignIn.completeNative")(
+          function* (raw: typeof OAuthNativeSignInComplete.Type) {
+            yield* noAmbient();
+            // Unsupported adapters reject before any flow is consumed.
+            if (exchangeNativeIdentity === undefined || access !== undefined)
+              return yield* OAuthMethodUnsupported.make({});
+            const request = yield* snapshotOAuthNativeSignInComplete.effect(raw);
+
+            const binder = Object.freeze({
+              ...(yield* verifyBinding(request.flowId, request.requestBinding).pipe(
+                Effect.catchCause((cause) => Effect.failCause(Cause.map(cause, binderError))),
+              )),
+            });
+
+            const state = yield* nativeStateDigest(
+              request.flowId,
+              request.provider,
+              binder.verifier,
+            );
+
+            const decision = yield* consume(
+              {
+                moduleId: id,
+                generation: policy.generation,
+                flowId: request.flowId,
+                provider: request.provider,
+                callbackId: OAuthNativeCallbackId,
+                stateDigest: state,
+                requestBindingVerifier: binder.verifier,
+                requestBindingExpiresAtMillis: binder.expiresAtMillis,
+              },
+              (value, journal) => journal.prepare(snapshotOAuthConsumeDecision.sync(value)),
+            ).pipe(Effect.flatMap(read));
+
+            if (decision._tag !== "Consumed") return yield* OAuthRejected.make({});
+            const flow = yield* snapshotOAuthSignInFlow.effect(decision.flow);
+            const context = flow.context;
+
+            if (
+              context.moduleId !== id ||
+              context.generation !== policy.generation ||
+              context.flowId !== request.flowId ||
+              context.provider !== request.provider ||
+              context.callbackId !== OAuthNativeCallbackId ||
+              context.redirectUri !== undefined ||
+              context.protocol !== "oidc" ||
+              context.responseIssuerMode !== "unsupported" ||
+              context.access !== undefined ||
+              context.stateDigest !== state ||
+              context.requestBindingVerifier !== binder.verifier ||
+              context.requestBindingExpiresAtMillis !== binder.expiresAtMillis ||
+              context.expiresAtMillis > context.requestBindingExpiresAtMillis
+            )
+              return yield* OAuthUnavailable.make({});
+
+            const start = yield* DateTime.now;
+
+            const identity = yield* exchangeWithin(
+              Effect.gen(function* () {
+                const secrets = yield* open({ context, sealed: flow.sealed }).pipe(
+                  Effect.flatMap((value) => snapshotOAuthTransactionSecrets.effect(value)),
+                );
+
+                if (secrets.oidcNonce === undefined || secrets.pkceVerifier !== undefined)
+                  return yield* OAuthUnavailable.make({});
+
+                return yield* exchangeNativeIdentity({
+                  configuration: yield* snapshotOAuthNativeProtocolConfiguration.effect({
+                    provider: context.provider,
+                    protocol: "oidc",
+                    configurationGeneration: context.configurationGeneration,
+                    issuer: context.issuer,
+                    responseIssuerMode: "unsupported",
+                    callbackId: context.callbackId,
+                  }),
+                  response: {
+                    code: request.code,
+                    ...(request.idToken === undefined ? {} : { idToken: request.idToken }),
+                    ...(request.user === undefined ? {} : { user: request.user }),
+                  },
+                  secrets,
+                  verificationStartedAt: start,
+                }).pipe(
+                  Effect.flatMap((value) => snapshotOAuthVerifiedExternalIdentity.effect(value)),
+                );
+              }),
+              context.exchangeTimeoutMillis,
+            );
+
+            return yield* settle(flow, identity, DateTime.toEpochMillis(start), () =>
+              Effect.as(Effect.void, undefined),
+            );
+          },
+          Effect.provideService(SecureRandom.SecureRandom, crypto),
+          Effect.provideService(Digest.Digest, digests),
+          Effect.tapError((error) =>
+            reportAuthDiagnostic(
+              "oauth-completion",
+              error._tag === "OAuthUnavailable" ? "unavailable" : "rejected",
+            ),
+          ),
+        );
+
+        return SignIn.of({ begin, complete, beginNative, completeNative });
       }),
     );
   };
@@ -946,6 +1214,26 @@ export const makeOAuthMethod = <
     credentials: true,
   });
 
+  const NativeBegin = makeOperation(`${moduleId}/sign-in/native/begin`, {
+    payload: OAuthNativeSignInBegin,
+    success: OAuthNativeSignInAuthorization,
+    error: Failure,
+    access: "any",
+    exposure: "public",
+    replay: "non-idempotent",
+    credentials: true,
+  });
+
+  const NativeComplete = makeOperation(`${moduleId}/sign-in/native/complete`, {
+    payload: OAuthNativeSignInComplete,
+    success: CompletionResult,
+    error: Failure,
+    access: "any",
+    exposure: "public",
+    replay: "single-use",
+    credentials: true,
+  });
+
   /** Allocate once per execution, outside codecs and transport retries. The
    * underlying Begin operation keeps the explicit IDs used by persistence. */
   const signIn = Effect.fn("OAuth.signInRequest")(function* (
@@ -969,6 +1257,28 @@ export const makeOAuthMethod = <
     return yield* Begin.invoke(invocation, { ...input, flowId });
   });
 
+  /** Native counterpart of signIn; the server allocates the flow ID. */
+  const nativeSignIn = Effect.fn("OAuth.nativeSignInRequest")(function* (
+    invocation: AuthInvocation,
+    raw: typeof OAuthNativeSignInInput.Encoded,
+  ) {
+    const input = yield* Schema.decodeEffect(OAuthNativeSignInInput)(raw).pipe(
+      Effect.mapError(() => InvalidOperationInput.make({})),
+    );
+
+    const crypto = yield* SecureRandom.SecureRandom;
+
+    const flowId = yield* crypto
+      .uuidV4()
+      .pipe(
+        Effect.catchCause((cause) =>
+          Effect.failCause(Cause.map(cause, () => OAuthUnavailable.make({}))),
+        ),
+      );
+
+    return yield* NativeBegin.invoke(invocation, { ...input, flowId });
+  });
+
   const handlersLayer = Layer.mergeAll(
     Begin.credentialHandlerLayer(
       Effect.fn("OAuth.Begin")(function* (input) {
@@ -978,6 +1288,16 @@ export const makeOAuthMethod = <
     Complete.credentialHandlerLayer(
       Effect.fn("OAuth.Complete")(function* (input) {
         return yield* (yield* SignIn).complete(input);
+      }),
+    ),
+    NativeBegin.credentialHandlerLayer(
+      Effect.fn("OAuth.NativeBegin")(function* (input) {
+        return yield* (yield* SignIn).beginNative(input);
+      }),
+    ),
+    NativeComplete.credentialHandlerLayer(
+      Effect.fn("OAuth.NativeComplete")(function* (input) {
+        return yield* (yield* SignIn).completeNative(input);
       }),
     ),
   );
@@ -1042,9 +1362,10 @@ export const makeOAuthMethod = <
     connected,
     CompletionResult,
     signIn,
-    operations: Object.freeze({ Begin, Complete }),
+    nativeSignIn,
+    operations: Object.freeze({ Begin, Complete, NativeBegin, NativeComplete }),
     handlersLayer,
-    group: operationGroup(Begin, Complete),
+    group: operationGroup(Begin, Complete, NativeBegin, NativeComplete),
   });
 };
 
@@ -1053,6 +1374,14 @@ const snapshotOAuthVerifiedExternalIdentity = makeOAuthSnapshot(OAuthVerifiedExt
 const snapshotOAuthRegistrationAuthentication = makeOAuthSnapshot(OAuthRegistrationAuthentication);
 const snapshotOAuthSignInPolicy = makeOAuthSnapshot(OAuthSignInPolicy);
 const snapshotOAuthSignInBegin = makeOAuthSnapshot(OAuthSignInBegin);
+const snapshotOAuthNativeSignInBegin = makeOAuthSnapshot(OAuthNativeSignInBegin);
+const snapshotOAuthNativeSignInComplete = makeOAuthSnapshot(OAuthNativeSignInComplete);
+const snapshotOAuthNativeProtocolPreparation = makeOAuthSnapshot(OAuthNativeProtocolPreparation);
+
+const snapshotOAuthNativeProtocolConfiguration = makeOAuthSnapshot(
+  OAuthNativeProtocolConfiguration,
+);
+
 const snapshotOAuthProtocolPreparation = makeOAuthSnapshot(OAuthProtocolPreparation);
 const snapshotOAuthSignInTransactionContext = makeOAuthSnapshot(OAuthSignInTransactionContext);
 const snapshotOAuthTransactionSecrets = makeOAuthSnapshot(OAuthTransactionSecrets);

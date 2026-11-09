@@ -28,6 +28,7 @@ import {
   OAuthInstant,
   OAuthModuleId,
   OAuthProtocolConfiguration,
+  OAuthRedirectUri,
   OAuthSealedTransaction,
   OAuthSignInComplete,
   OAuthSignInPolicy,
@@ -174,6 +175,8 @@ export type OAuthConnectedCaller = typeof OAuthConnectedCaller.Type;
 /** Digest this immutable intent before adding its accepted begin authorization. */
 export const OAuthConnectedIntentContext = Schema.Struct({
   ...OAuthSignInTransactionContext.fields,
+  /** These flows always come from a redirect callback. */
+  redirectUri: OAuthRedirectUri,
   namespace: Schema.Literal("effect-auth/oauth-connected-context/v1"),
   revision: OAuthAccountRevision,
   profile: OAuthConnectedProfile,

@@ -146,6 +146,10 @@ export interface OpenIdConnectOidcProvider extends ProviderGeneration {
   /** @internal Provider-specific discovery metadata, retained by the configuration codec. */
   readonly [discoveryProfile]?: typeof DiscoveryProfile.Type;
   readonly protocol: "oidc";
+  /** Defaults to web. A native registration is a platform client, such as an iOS
+   * bundle ID. It serves only native sign-in, redeems codes without a redirect URI
+   * and requires `pkceS256: false`. Web and native generations are numbered separately. */
+  readonly kind?: "web" | "native";
   readonly idTokenSignedResponseAlg: ReadonlyArray<IdTokenSignedResponseAlg>;
   readonly pkceS256: boolean;
   readonly userInfo: OidcUserInfoMode;

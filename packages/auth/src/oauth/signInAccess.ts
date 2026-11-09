@@ -99,15 +99,18 @@ const make = Effect.fnUntraced(function* (
   const configurationFor = Effect.fn("OAuth.access.configuration")(function* (
     flow: OAuthSignInFlow,
   ) {
+    const { redirectUri, access } = flow.context;
+
     if (
-      flow.context.access === undefined ||
-      !connectedSame(OAuthConnectedProfile, flow.context.access, profile)
+      redirectUri === undefined ||
+      access === undefined ||
+      !connectedSame(OAuthConnectedProfile, access, profile)
     )
       return yield* OAuthRejected.make({});
 
     return yield* snapshotOAuthConnectedConfiguration.effect({
-      ...(yield* snapshotOAuthProtocolConfiguration.effect(flow.context)),
-      profile: flow.context.access,
+      ...(yield* snapshotOAuthProtocolConfiguration.effect({ ...flow.context, redirectUri })),
+      profile: access,
     });
   });
 

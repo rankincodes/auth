@@ -55,12 +55,26 @@ export const OAuthProtocolConfiguration = Schema.Struct({
 
 export type OAuthProtocolConfiguration = typeof OAuthProtocolConfiguration.Type;
 
+/** A native platform client: OIDC, no redirect URI and no response issuer. */
+export const OAuthNativeProtocolConfiguration = Schema.Struct({
+  provider: OAuthProtocolConfiguration.fields.provider,
+  protocol: Schema.Literal("oidc"),
+  configurationGeneration: OAuthProtocolConfiguration.fields.configurationGeneration,
+  issuer: OAuthProtocolConfiguration.fields.issuer,
+  responseIssuerMode: Schema.Literal("unsupported"),
+  callbackId: OAuthProtocolConfiguration.fields.callbackId,
+});
+
+export type OAuthNativeProtocolConfiguration = typeof OAuthNativeProtocolConfiguration.Type;
+
 export const OAuthSignInTransactionContext = Schema.Struct({
   namespace: Schema.Literal("effect-auth/oauth-sign-in-context/v1"),
   moduleId: OAuthModuleId,
   generation: OAuthGeneration,
   flowId: RequestBindingFlowId,
   ...OAuthProtocolConfiguration.fields,
+  /** Absent only for native sign-in, whose provider code was minted without a redirect. */
+  redirectUri: Schema.optionalKey(OAuthRedirectUri),
   /** Captured permission/retention policy; part of the encrypted transaction context. */
   access: Schema.optionalKey(OAuthConnectedProfile),
   returnTarget: OAuthReturnTarget,
@@ -304,6 +318,57 @@ export const OAuthSignInAuthorization = Schema.Struct({
   authorizationUrl: OAuthAuthorizationUrl,
   expiresAtMillis: OAuthInstant,
 });
+
+/** Native sign-in has no callback route. Its flows use this reserved callback
+ * identity and omit `redirectUri`; web callbacks never complete them. */
+export const OAuthNativeCallbackId = OAuthCallbackId.make("native");
+
+/** Public native sign-in request. The server generates its flow identity. */
+export const OAuthNativeSignInInput = Schema.Struct({
+  provider: OAuthProviderKey,
+  returnTarget: OAuthSignInInput.fields.returnTarget,
+});
+
+export const OAuthNativeSignInBegin = Schema.Struct({
+  flowId: RequestBindingFlowId,
+  ...OAuthNativeSignInInput.fields,
+});
+
+/** The OIDC nonce for the platform sign-in request, such as Apple's
+ * `ASAuthorizationAppleIDRequest.nonce`. It is bound to this flow, not a credential. */
+export const OAuthNativeSignInAuthorization = Schema.Struct({
+  flowId: RequestBindingFlowId,
+  nonce: Schema.RedactedFromValue(Schema.String.check(Schema.isPattern(/^[A-Za-z0-9_-]{43}$/))),
+  expiresAtMillis: OAuthInstant,
+});
+
+/** What the platform returned. The code is always redeemed; `idToken` is optional
+ * corroboration and is never accepted without that exchange. */
+export const OAuthNativeCodeResponse = Schema.Struct({
+  code: OAuthCodeResponse.fields.code,
+  idToken: Schema.optionalKey(
+    Schema.RedactedFromValue(Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(16384))),
+  ),
+  /** First-consent name, as Apple's web `user` JSON: `{"name":{"firstName","lastName"}}`.
+   * Unsigned display data only; it never selects identity. */
+  user: OAuthCodeResponse.fields.user,
+});
+
+export type OAuthNativeCodeResponse = typeof OAuthNativeCodeResponse.Type;
+
+export const OAuthNativeSignInComplete = Schema.Struct({
+  flowId: RequestBindingFlowId,
+  provider: OAuthProviderKey,
+  requestBinding: RequestBindingCredential,
+  ...OAuthNativeCodeResponse.fields,
+});
+
+export const OAuthNativeProtocolPreparation = Schema.Struct({
+  configuration: OAuthNativeProtocolConfiguration,
+  secrets: OAuthTransactionSecrets,
+});
+
+export type OAuthNativeProtocolPreparation = typeof OAuthNativeProtocolPreparation.Type;
 
 export const OAuthSignInPolicy = Schema.Struct({
   generation: OAuthGeneration,

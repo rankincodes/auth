@@ -1,3 +1,4 @@
+import type * as Oidc from "@yielded/oauth/Oidc";
 import * as Pkce from "@yielded/oauth/Pkce";
 import * as Cause from "effect/Cause";
 import * as Digest from "effect/crypto/Digest";
@@ -22,6 +23,10 @@ import {
   OAuthCodeResponse,
   OAuthDisplayProfile,
   OAuthLoginHint,
+  OAuthNativeCallbackId,
+  OAuthNativeCodeResponse,
+  OAuthNativeProtocolConfiguration,
+  OAuthNativeProtocolPreparation,
   OAuthProtocolConfiguration,
   OAuthProtocolPreparation,
   OAuthTransactionSecrets,
@@ -29,12 +34,13 @@ import {
 } from "../../signInModels";
 import { makeOAuthSnapshot } from "../../signInSnapshot";
 import { tokenCompatibility } from "./compatibility";
-import type { InstalledConfiguration } from "./configuration";
+import { registrationKind, type InstalledConfiguration } from "./configuration";
 import { discoveryProfile } from "./discovery";
 import {
   persistedResponseIssuerMode,
   type OpenIdConnectAuthentication,
   type OpenIdConnectConfigurationError,
+  type OpenIdConnectOidcProvider,
 } from "./models";
 import { PrivateKeyClientSecret } from "./privateKeyJwt";
 import { decodeOidcProfile, mergeAppleCallbackUser, mergeUserInfo } from "./profile";
@@ -62,6 +68,20 @@ const exchangeInput = Schema.toType(
   }),
 );
 
+const nativeBeginInput = Schema.Struct({
+  provider: OAuthProviderKey,
+  flowId: RequestBindingFlowId,
+});
+
+const nativeExchangeInput = Schema.toType(
+  Schema.Struct({
+    configuration: OAuthNativeProtocolConfiguration,
+    response: OAuthNativeCodeResponse,
+    secrets: OAuthTransactionSecrets,
+    verificationStartedAt: Schema.DateTimeUtcFromMillis,
+  }),
+);
+
 const plainIdentitySchema = Schema.Struct({
   subject: OAuthVerifiedExternalIdentity.fields.identity.fields.subject,
   profile: Schema.optionalKey(OAuthDisplayProfile),
@@ -69,6 +89,38 @@ const plainIdentitySchema = Schema.Struct({
 
 const unavailable = () => OAuthUnavailable.make({});
 const rejected = () => OAuthProtocolRejected.make({});
+
+/** Project verified claims. Apple's unsigned first-consent name only fills missing names. */
+const oidcIdentity = Effect.fnUntraced(function* (
+  provider: OpenIdConnectOidcProvider,
+  verified: Oidc.Verified,
+  claims: Schema.JsonObject,
+  user: string | undefined,
+) {
+  const profile = yield* decodeOidcProfile(
+    provider[discoveryProfile] === "apple" ? yield* mergeAppleCallbackUser(claims, user) : claims,
+    provider.profileSchema,
+  );
+
+  const decodedSubject =
+    provider.decodeSubject === undefined
+      ? verified.subject
+      : yield* provider.decodeSubject(Redacted.value(verified.claims));
+
+  const subject = yield* subjectInTenant(
+    provider.issuer,
+    Redacted.value(verified.claims),
+    decodedSubject,
+  );
+
+  return yield* snapshotOAuthVerifiedExternalIdentity.effect({
+    identity: { provider: provider.provider, issuer: provider.issuer, subject },
+    ...(profile === undefined ? {} : { profile }),
+    ...(verified.upstreamAuthenticatedAt === undefined
+      ? {}
+      : { upstreamAuthenticatedAt: verified.upstreamAuthenticatedAt }),
+  });
+});
 
 export const makeOpenIdConnectOAuthProtocol = Effect.fn("makeOpenIdConnectOAuthProtocol")(
   // Capture one provider table; each generation retains its own receipt rules.
@@ -106,7 +158,10 @@ export const makeOpenIdConnectOAuthProtocol = Effect.fn("makeOpenIdConnectOAuthP
       );
 
       const entry = installed.find(
-        ({ provider }) => provider.issuance === "active" && provider.provider === request.provider,
+        ({ provider }) =>
+          provider.issuance === "active" &&
+          provider.provider === request.provider &&
+          registrationKind(provider) === "web",
       );
 
       const provider = entry?.provider;
@@ -197,7 +252,8 @@ export const makeOpenIdConnectOAuthProtocol = Effect.fn("makeOpenIdConnectOAuthP
         const entry = installed.find(
           ({ provider }) =>
             provider.provider === saved.provider &&
-            provider.configurationGeneration === saved.configurationGeneration,
+            provider.configurationGeneration === saved.configurationGeneration &&
+            registrationKind(provider) === "web",
         );
 
         if (entry === undefined) return yield* unavailable();
@@ -206,6 +262,8 @@ export const makeOpenIdConnectOAuthProtocol = Effect.fn("makeOpenIdConnectOAuthP
         const callback = provider.callbacks.find(
           (candidate) => candidate.callbackId === saved.callbackId,
         );
+
+        if (callback === undefined) return yield* unavailable();
 
         const responseIssuerMode = persistedResponseIssuerMode(
           provider.responseIssuerMode,
@@ -216,7 +274,7 @@ export const makeOpenIdConnectOAuthProtocol = Effect.fn("makeOpenIdConnectOAuthP
           provider.protocol !== saved.protocol ||
           provider.issuer !== saved.issuer ||
           responseIssuerMode !== saved.responseIssuerMode ||
-          callback?.redirectUri !== saved.redirectUri
+          callback.redirectUri !== saved.redirectUri
         )
           return yield* unavailable();
         if (
@@ -309,35 +367,7 @@ export const makeOpenIdConnectOAuthProtocol = Effect.fn("makeOpenIdConnectOAuthP
                 })()
               : Redacted.value(verified.claims);
 
-          const profile = yield* decodeOidcProfile(
-            provider[discoveryProfile] === "apple"
-              ? yield* mergeAppleCallbackUser(claims, request.response.user)
-              : claims,
-            provider.profileSchema,
-          );
-
-          const decodedSubject =
-            provider.decodeSubject === undefined
-              ? verified.subject
-              : yield* provider.decodeSubject(Redacted.value(verified.claims));
-
-          const subject = yield* subjectInTenant(
-            provider.issuer,
-            Redacted.value(verified.claims),
-            decodedSubject,
-          );
-
-          return yield* snapshotOAuthVerifiedExternalIdentity.effect({
-            identity: {
-              provider: provider.provider,
-              issuer: provider.issuer,
-              subject,
-            },
-            ...(profile === undefined ? {} : { profile }),
-            ...(verified.upstreamAuthenticatedAt === undefined
-              ? {}
-              : { upstreamAuthenticatedAt: verified.upstreamAuthenticatedAt }),
-          });
+          return yield* oidcIdentity(provider, verified, claims, request.response.user);
         }
 
         if (provider.protocol !== "oauth") return yield* unavailable();
@@ -383,7 +413,180 @@ export const makeOpenIdConnectOAuthProtocol = Effect.fn("makeOpenIdConnectOAuthP
         });
       });
 
+    const prepareNative: NonNullable<OAuthProtocol["Service"]["prepareNative"]> = Effect.fn(
+      "OpenIdConnect.prepareNative",
+    )(function* (input) {
+      const request = yield* Schema.decodeEffect(nativeBeginInput)(input).pipe(
+        Effect.mapError(() => OAuthRejected.make({})),
+      );
+
+      const entry = installed.find(
+        ({ provider }) =>
+          provider.issuance === "active" &&
+          provider.provider === request.provider &&
+          registrationKind(provider) === "native",
+      );
+
+      if (entry === undefined || entry.provider.protocol !== "oidc")
+        return yield* OAuthRejected.make({});
+      const provider = entry.provider;
+
+      const random = Pkce.random().pipe(
+        Effect.provideService(SecureRandom.SecureRandom, crypto),
+        Effect.provideService(Digest.Digest, digests),
+        Effect.catchCause((cause) => Effect.failCause(Cause.map(cause, unavailable))),
+      );
+
+      // The state never leaves the sealed transaction, so no callback can present it.
+      const state = yield* random;
+      const nonce = yield* random;
+
+      return yield* snapshotOAuthNativeProtocolPreparation.effect({
+        configuration: {
+          provider: provider.provider,
+          protocol: provider.protocol,
+          configurationGeneration: provider.configurationGeneration,
+          issuer: provider.issuer,
+          responseIssuerMode: "unsupported",
+          callbackId: OAuthNativeCallbackId,
+        },
+        secrets: {
+          namespace: "effect-auth/oauth-transaction-secrets/v1",
+          state,
+          oidcNonce: nonce,
+        },
+      });
+    });
+
+    const exchangeNativeIdentity: NonNullable<OAuthProtocol["Service"]["exchangeNativeIdentity"]> =
+      Effect.fn("OpenIdConnect.exchangeNativeIdentity")(function* (input) {
+        const request = yield* snapshotNativeExchangeInput.effect(input);
+        const saved = request.configuration;
+
+        const entry = installed.find(
+          ({ provider }) =>
+            provider.provider === saved.provider &&
+            provider.configurationGeneration === saved.configurationGeneration &&
+            registrationKind(provider) === "native",
+        );
+
+        if (
+          entry === undefined ||
+          entry.verifier === undefined ||
+          entry.provider.protocol !== "oidc" ||
+          entry.provider.issuer !== saved.issuer ||
+          saved.callbackId !== OAuthNativeCallbackId
+        )
+          return yield* unavailable();
+        const provider = entry.provider;
+        const verifier = entry.verifier;
+        const nonce = request.secrets.oidcNonce;
+
+        if (nonce === undefined || request.secrets.pkceVerifier !== undefined)
+          return yield* rejected();
+        const startedAt = DateTime.toEpochMillis(request.verificationStartedAt);
+
+        if (startedAt < 0 || startedAt > DateTime.toEpochMillis(yield* DateTime.now))
+          return yield* rejected();
+
+        const verify = (
+          token: Redacted.Redacted<string>,
+          options: {
+            readonly accessToken?: Redacted.Redacted<string>;
+            readonly nonceSubject?: string;
+          },
+        ) =>
+          verifier
+            .verify(token, {
+              verificationStartedAt: request.verificationStartedAt,
+              nonce,
+              code: request.response.code,
+              ...options,
+              ...(provider.maxAgeSeconds === undefined
+                ? {}
+                : { maxAgeSeconds: provider.maxAgeSeconds }),
+            })
+            .pipe(
+              Effect.catchCause((cause) =>
+                Effect.failCause(
+                  Cause.map(cause, (error) =>
+                    error._tag === "OAuthRejected" ? rejected() : unavailable(),
+                  ),
+                ),
+              ),
+            );
+
+        // Check the caller's platform token, including its nonce and code hash, before
+        // spending the code. It only corroborates the exchange and never replaces it.
+        const corroborated =
+          request.response.idToken === undefined
+            ? undefined
+            : yield* verify(request.response.idToken, {});
+
+        const clientSecret = yield* requestSecret(provider.authentication);
+
+        // Platform codes carry no redirect; the native registration's client redeems it.
+        const receipt = yield* entry.client
+          .codeGrant({
+            code: request.response.code,
+            ...(provider.tokenParameters === undefined
+              ? {}
+              : { parameters: provider.tokenParameters }),
+            ...(clientSecret === undefined ? {} : { clientSecret }),
+          })
+          .pipe(
+            Effect.catchCause((cause) => Effect.failCause(Cause.map(cause, unavailable))),
+            Effect.ensuring(
+              Effect.sync(() => {
+                if (clientSecret !== undefined) Redacted.wipeUnsafe(clientSecret);
+              }),
+            ),
+          );
+
+        const grant = yield* tokens(receipt, undefined, {
+          scopes: provider.scopes,
+          refreshRequired: false,
+          operation: "authorization_code",
+        });
+
+        if (grant.idToken === undefined) return yield* unavailable();
+
+        // Without a nonce in the redeemed token, the platform token must prove it for
+        // the same subject. Otherwise the redeemed token's own nonce must match.
+        const verified = yield* verify(grant.idToken, {
+          accessToken: grant.accessToken,
+          ...(corroborated === undefined ? {} : { nonceSubject: corroborated.subject }),
+        });
+
+        if (corroborated !== undefined && corroborated.subject !== verified.subject)
+          return yield* rejected();
+
+        return yield* oidcIdentity(
+          provider,
+          verified,
+          Redacted.value(verified.claims),
+          request.response.user,
+        );
+      });
+
     return OAuthProtocol.of({
+      prepareNative: (input) => run(prepareNative(input)),
+      exchangeNativeIdentity: (input) =>
+        run(
+          exchangeNativeIdentity(input).pipe(
+            timeoutOrElseWithCause({
+              duration: timeoutSeconds * 1000,
+              orElse: () => Effect.fail(unavailable()),
+            }),
+          ),
+        ).pipe(
+          Effect.tapError((error) =>
+            reportAuthDiagnostic(
+              "oauth-exchange",
+              error._tag === "OAuthProtocolRejected" ? "rejected" : "unavailable",
+            ),
+          ),
+        ),
       prepareAuthorization: (input) => run(prepareAuthorization(input)),
       exchangeVerifiedIdentity: (input) =>
         run(
@@ -408,3 +611,5 @@ export const makeOpenIdConnectOAuthProtocol = Effect.fn("makeOpenIdConnectOAuthP
 const snapshotOAuthProtocolPreparation = makeOAuthSnapshot(OAuthProtocolPreparation);
 const snapshotExchangeInput = makeOAuthSnapshot(exchangeInput);
 const snapshotOAuthVerifiedExternalIdentity = makeOAuthSnapshot(OAuthVerifiedExternalIdentity);
+const snapshotOAuthNativeProtocolPreparation = makeOAuthSnapshot(OAuthNativeProtocolPreparation);
+const snapshotNativeExchangeInput = makeOAuthSnapshot(nativeExchangeInput);

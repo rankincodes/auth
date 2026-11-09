@@ -90,6 +90,8 @@ const bindSignIn = <
       {
         signIn: module.signIn,
         completeSignIn: module.operations.Complete.invoke,
+        nativeSignIn: module.nativeSignIn,
+        completeNativeSignIn: module.operations.NativeComplete.invoke,
       },
       module
         .layer(options.policy)
@@ -313,6 +315,8 @@ const bindDefineRegistration = <
       {
         signIn: module.signIn,
         completeSignIn: module.operations.Complete.invoke,
+        nativeSignIn: module.nativeSignIn,
+        completeNativeSignIn: module.operations.NativeComplete.invoke,
         register: registration.operations.Complete.invoke,
       },
       layer.pipe(Layer.merge(Layer.effect(SecureRandom.SecureRandom, SecureRandom.SecureRandom))),

@@ -93,6 +93,36 @@ continuation sealed at the authenticated begin, then still require that subject
 and the binding. Query callbacks still require the live session. HTTPS is
 required, because `SameSite=None` is invalid without `Secure`.
 
+## Native apps
+
+On iOS and macOS, `ASAuthorizationController` signs in without a browser. Add a
+`kind: "native"` registration whose client ID is the app's bundle ID beside the
+Services ID registration. Both can share the same key:
+
+```ts
+Apple.provider({
+  registrations: [
+    { clientId: servicesId, teamId, keyId, privateKey },
+    { kind: "native", clientId: bundleId, teamId, keyId, privateKey },
+  ],
+});
+```
+
+Add `AuthContract.oauthNativeSignIn()` and
+`AuthContract.oauthCompleteNativeSignIn(sessions)` to the contract. The app calls
+`nativeSignIn({ provider: "apple", returnTarget })` and passes the returned `nonce`
+to `ASAuthorizationAppleIDRequest.nonce`. It then calls `completeNativeSignIn`
+with the `flowId`, the credential's `authorizationCode`, and optionally its
+`identityToken` and, on first consent, `user` JSON built from `fullName`
+(`{"name":{"firstName","lastName"}}`). The request binding travels through the
+[native client credentials](../reference/client#client-options), never the payload.
+
+The server redeems the code with the bundle ID and no `redirect_uri`, then
+verifies the returned ID token and the flow's nonce. If that ID token lacks the
+nonce, the platform `identityToken` must carry it for the same subject. Results,
+registration, and sessions match the web flow. Each registration serves only its
+own flow.
+
 ## Run the example
 
 The [Apple application](https://github.com/yielded-dev/auth/blob/main/examples/auth/src/apple-app.ts)

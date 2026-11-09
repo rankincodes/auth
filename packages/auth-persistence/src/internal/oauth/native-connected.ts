@@ -273,12 +273,18 @@ export const makeNativeOAuthConnectedServices = Effect.fnUntraced(function* (
             ]);
             previous = input.previous;
             const profile = context.access;
+            const redirectUri = context.redirectUri;
 
             if (
               profile === undefined ||
+              redirectUri === undefined ||
               !sameConfiguration(
                 token.configuration,
-                M.snapshotOAuthSync(M.OAuthConnectedConfiguration, { ...context, profile }),
+                M.snapshotOAuthSync(M.OAuthConnectedConfiguration, {
+                  ...context,
+                  redirectUri,
+                  profile,
+                }),
               )
             )
               return yield* rejected();

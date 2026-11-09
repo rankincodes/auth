@@ -16,6 +16,7 @@ import {
   OAuthExternalIdentity,
   OAuthInstant,
   OAuthModuleId,
+  OAuthRedirectUri,
   OAuthSealedTransaction,
   OAuthSignInAccess,
   OAuthSignInBegin,
@@ -171,6 +172,8 @@ export type OAuthActionAuthorization = typeof OAuthActionAuthorization.Type;
  * includes the accepted authorization without a self-referential digest. */
 export const OAuthLinkIntentContext = Schema.Struct({
   ...OAuthSignInTransactionContext.fields,
+  /** These flows always come from a redirect callback. */
+  redirectUri: OAuthRedirectUri,
   namespace: Schema.Literal("effect-auth/oauth-link-context/v1"),
   revision: OAuthAccountRevision,
   maximumEvidenceAgeMillis: OAuthAccountsPolicy.fields.maximumEvidenceAgeMillis,

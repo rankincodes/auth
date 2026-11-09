@@ -164,6 +164,11 @@ export const makeOAuth = <E, R, ResponseR>(
         exchangeVerifiedIdentity: (input) =>
           protocols.get(input.configuration.provider)?.exchangeVerifiedIdentity(input) ??
           OAuthUnavailable.make({}),
+        prepareNative: (input) =>
+          protocols.get(input.provider)?.prepareNative?.(input) ?? OAuthRejected.make({}),
+        exchangeNativeIdentity: (input) =>
+          protocols.get(input.configuration.provider)?.exchangeNativeIdentity?.(input) ??
+          OAuthUnavailable.make({}),
       });
 
       const connected = OAuthConnectedProtocol.of({

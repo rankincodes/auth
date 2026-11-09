@@ -25,6 +25,10 @@ const pem = Schema.toType(
 const lifetime = Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 15_777_000 }));
 
 const Registration = Schema.Struct({
+  /** Web (default): a Services ID for the browser flow. Native: an App ID (bundle ID)
+   * for `ASAuthorizationController` codes. A native registration serves only native
+   * sign-in; each kind keeps one active generation. */
+  kind: Schema.optionalKey(Schema.Literals(["web", "native"])),
   clientId: Schema.NonEmptyString,
   teamId: identifier,
   keyId: identifier,
@@ -116,7 +120,9 @@ export const mintClientSecret = Effect.fn("Apple.mintClientSecret")(function* (o
  * openid scope, client_secret_post, form_post callbacks, advertised RS256, and
  * no PKCE. AppleUserProfile decodes boolean or string email_verified /
  * is_private_email flags. Name arrives once in the user form field on first consent and is merged
- * into that profile. No UserInfo request or retained API access is installed.
+ * into that profile. A `kind: "native"` registration adds native sign-in for the
+ * app's bundle ID beside the web Services ID registration.
+ * No UserInfo request or retained API access is installed.
  * Credentials are captured when the host builds its Layer; supply HttpClient and
  * crypto in that Scope. */
 export const provider = (

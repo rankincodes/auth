@@ -313,6 +313,7 @@ it.live.each(backends)(
       const connectedFlow = OAuth.OAuthConnectedFlow.make({
         context: {
           ...flow.context,
+          redirectUri: configuration.redirectUri,
           namespace: "effect-auth/oauth-connected-context/v1",
           flowId: authorization.challenge.flowId,
           revision: credential.revision,

@@ -153,6 +153,7 @@ const optionsSchema = <R>() =>
           Schema.Struct({
             ...common,
             protocol: Schema.Literal("oidc"),
+            kind: Schema.optionalKey(Schema.Literals(["web", "native"])),
             [discoveryProfile]: Schema.optionalKey(DiscoveryProfile),
             idTokenSignedResponseAlg: Schema.Array(IdTokenSignedResponseAlg).check(
               Schema.isMinLength(1),
@@ -353,6 +354,10 @@ const checkParameters = Effect.fnUntraced(function* (
 
 export type Provider<R> = OpenIdConnectOidcProvider | OpenIdConnectOAuthProvider<R>;
 
+/** Plain OAuth providers and unmarked OIDC registrations are web clients. */
+export const registrationKind = <R>(provider: Provider<R>): "web" | "native" =>
+  provider.protocol === "oidc" && provider.kind === "native" ? "native" : "web";
+
 export interface InstalledProvider<R> extends NativeProvider {
   readonly provider: Provider<R>;
   readonly metadata: OAuth.Metadata;
@@ -422,15 +427,19 @@ export const prepareConfigurations = Effect.fn("OpenIdConnect.prepareConfigurati
   const names = new Set<string>();
 
   for (const provider of providers) {
-    const generation = `${provider.provider.length}:${provider.provider}:${provider.configurationGeneration}`;
+    // Web and native registrations of one provider are independent generation sequences.
+    const registration = `${registrationKind(provider)}:${provider.provider}`;
+    const generation = `${registration.length}:${registration}:${provider.configurationGeneration}`;
 
     if (generations.has(generation)) return yield* configError("generation");
     generations.add(generation);
-    names.add(provider.provider);
+    names.add(registration);
     if (provider.issuance === "active") {
-      if (active.has(provider.provider)) return yield* configError("generation");
-      active.add(provider.provider);
+      if (active.has(registration)) return yield* configError("generation");
+      active.add(registration);
     }
+    if (registrationKind(provider) === "native" && provider.pkceS256)
+      return yield* configError("parameters");
     const issuer = yield* endpoint(provider.issuer, "provider");
 
     if (provider.issuer.includes("?") || issuer.pathname.includes("/.well-known/"))
