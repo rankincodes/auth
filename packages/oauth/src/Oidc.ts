@@ -66,6 +66,11 @@ export interface VerificationInput {
   readonly maxAgeSeconds?: number;
   readonly accessToken?: Redacted.Redacted<string>;
   readonly code?: Redacted.Redacted<string>;
+  /** Subject of another ID token this verifier accepted for the same request with
+   * `nonce`. This token must carry that `sub`; it may omit `nonce`, which must still
+   * match when present. For issuers that drop the nonce from the token-endpoint ID
+   * token of a natively issued code. Not combined with `previous`. */
+  readonly nonceSubject?: string;
   /** Refresh continuation: same subject, optional nonce must match, auth_time cannot change.
    * A `{tenantid}` metadata issuer also requires the original token `iss`. */
   readonly previous?: {
@@ -108,6 +113,7 @@ const VerifyInput = Schema.Struct({
   maxAgeSeconds: Schema.optional(V.integer(0, 86400)),
   accessToken: Schema.optional(V.secret(16384)),
   code: Schema.optional(V.secret(16384)),
+  nonceSubject: Schema.optional(V.text(1024)),
   previous: Schema.optional(
     Schema.Struct({
       subject: V.text(1024),
@@ -116,7 +122,9 @@ const VerifyInput = Schema.Struct({
       issuer: Schema.optional(V.text(2048)),
     }),
   ),
-});
+}).check(
+  Schema.makeFilter((input) => input.previous === undefined || input.nonceSubject === undefined),
+);
 
 const IdClaims = Schema.Struct({
   iss: V.text(2048),
@@ -508,7 +516,10 @@ export const makeVerifier = Effect.fnUntraced(function* (
       return yield* claimFailure();
     if (policy.previous === undefined) {
       if (
-        claims.nonce !== expectedNonce ||
+        (policy.nonceSubject === undefined
+          ? claims.nonce !== expectedNonce
+          : claims.sub !== policy.nonceSubject ||
+            (claims.nonce !== undefined && claims.nonce !== expectedNonce)) ||
         (policy.maxAgeSeconds !== undefined &&
           (claims.auth_time === undefined ||
             claims.auth_time + policy.maxAgeSeconds < Math.floor(now)))
